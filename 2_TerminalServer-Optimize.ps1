@@ -1,111 +1,39 @@
-﻿<#
-.SYNOPSIS
-    Оптимизация Windows Server 2019 для роли RDS (Remote Desktop Services).
-    Гибрид моих наработок + лучшее из torbikua/rds-farm-setup, адаптировано под TL infrastructure.
+﻿# ═══════════════════════════════════════════════════════════════════════
+# Optimize-TerminalServer.ps1   v3.3
+# ═══════════════════════════════════════════════════════════════════════
+# Optimize Windows Server 2019 for RDS (Remote Desktop Services) role.
+# Hybrid: own work + best from torbikua/rds-farm-setup, TL infrastructure.
+#
+# v3.3 - REMOVED <#...#> comment-help block completely.
+#        PowerShell ISE has a bug where UTF-8 BOM files with cyrillic
+#        in <#...#> block fail to parse (comment-block not recognized).
+#        Single-line # comments work in any encoding without issues.
+# v3.2 - UTF-16 LE BOM -> UTF-8 BOM (universal Windows compatibility).
+# v3.1 - VM-aware Power Plan (HLT bug fix for virtualized Windows).
+# v3.0 - Added -DisableTelemetry (Sophia Script + HushWin best-of).
+# v2.1 - 3rd-party AV detection, WSearch COM ProgID fallbacks.
+# v2.0 - Hybrid w/ torbik: RDP UDP/codec, Power Plan, Memory tuning,
+#        Network TcpNoDelay, Event Log size, Temp Cleanup, Recycle Bin,
+#        optional TLS hardening + Account Lockout.
+# v1.x - Initial.
+#
+# USAGE:
+#   PowerShell -ExecutionPolicy Bypass -File 2_TerminalServer-Optimize.ps1
+#   PowerShell -ExecutionPolicy Bypass -File 2_TerminalServer-Optimize.ps1 -WhatIf
+#   PowerShell -ExecutionPolicy Bypass -File 2_TerminalServer-Optimize.ps1 -DisableTelemetry
+#
+# PARAMETERS:
+#   -WhatIf            Dry-run preview without changes
+#   -RemoveBloat       Remove Lightshot / Yandex / Mail.ru / Amigo
+#   -HardenTLS         Disable TLS 1.0/1.1, RC4/DES/3DES (may break legacy)
+#   -EnableLockout     Account lockout policy (5 attempts / 30 min)
+#   -EnableAVC         RDP AVC444/H.264 (only with NVIDIA GPU passthrough)
+#   -TuneSearch        Tune WSearch indexer (default: ON)
+#   -DisableTelemetry  Deep telemetry off (Sophia/HushWin best-of)
+#
+# REQUIREMENT: run as Administrator.
+# ═══════════════════════════════════════════════════════════════════════
 
-.DESCRIPTION
-    Безопасные оптимизации performance / RDP / network / security для terminal server.
-
-    БАЗОВО (без флагов) делает:
-      * Сброс накопленного WmiPrvSE CPU
-      * Restart Zabbix Agent (подхват новых intervals)
-      * Power Plan High Performance + CPU idle off
-      * Win32PrioritySeparation = 38 (foreground apps приоритетнее)
-      * Memory: LargeSystemCache + Memory Compression off
-      * Disable SysMain (Superfetch) - вреден на multi-user RDS
-      * Disable: Xbox/Maps/Geo/Insider/Fax/TabletInput/WerSvc (БЕЗ WSearch!)
-      * Disable Telemetry tasks (CEIP, Compatibility Appraiser, DiagTrack)
-      * Defender exclusions для 1C / Adobe / Excel / TEMP
-      * Defender QuickScan + scheduled weekly FullScan (Sun 02:00)
-      * WSearch TUNE (исключение мусорных папок, НЕ отключение)
-      * RDP UDP transport ON
-      * RDP visual: classic codec, wallpaper off, ClearType on, ColorDepth 24-bit
-      * Network: TcpNoDelay, RSS, autotuning normal
-      * Event log size increase (App=128, Sec=256, Sys=128, RDS=64 MB)
-      * Temp cleanup scheduled task (daily 03:00, files >7 days)
-      * Recycle Bin limit 512 MB
-
-.PARAMETER WhatIf
-    Dry-run: показывает что будет сделано, без применения изменений.
-
-.PARAMETER RemoveBloat
-    Удалить bloat (Lightshot / Yandex / Mail.ru / Amigo).
-
-.PARAMETER HardenTLS
-    Жёсткий TLS: отключить TLS 1.0/1.1, RC4/DES/3DES, оставить только TLS 1.2.
-    ВНИМАНИЕ: может сломать legacy клиентов (старые принтеры, старые версии 1C клиента, старый ERP).
-
-.PARAMETER EnableLockout
-    Включить Account Lockout policy (5 попыток / 30 мин блок / 15 мин reset).
-    По умолчанию НЕ включаем — может массово залочить пользователей при ротации паролей.
-    Рекомендуется только если RDP открыт в интернет.
-
-.PARAMETER EnableAVC
-    Включить RDP AVC444/H.264 hardware encoding.
-    ТОЛЬКО ЕСЛИ НА ХОСТЕ ЕСТЬ NVIDIA GPU С PASSTHROUGH (NVENC) ИЛИ INTEL iGPU С QSV.
-    На CPU-only серверах = software encoding на CPU = катастрофа (60% CPU на 30 сессий).
-    Скрипт проверит наличие GPU и предупредит если нет.
-
-.PARAMETER DisableTelemetry
-    Глубокое отключение телеметрии (Sophia/HushWin best-of):
-      * Services: dmwappushservice + diagnosticshub.standardcollector
-      * ETW AutoLoggers: DiagLog, AutoLogger-Diagtrack-Listener, SQMLogger -> Start=0
-      * +12 scheduled tasks (AITAgent, KernelCeipTask, Maps, WinSAT, FamilySafety, XblGameSave, FODCleanup, etc)
-      * HKLM Policies: AllowTelemetry=0, AdvertisingInfo Enabled=0, AppCompat\AITEnable=0, IsCensusDisabled=1
-      * Default User hive: применяет HKCU настройки для всех НОВЫХ RDP-пользователей
-        (BingSearch off, ContentDeliveryManager Subscribed* off, TailoredExperiences off)
-      * Office telemetry — только если Office установлен
-    БЕЗОПАСНО для RDS:
-      * НЕ удаляет CompatTelRunner.exe (ломает Windows Update + sfc /scannow)
-      * НЕ трогает per-user services PimIndex/Unistore/UserData (нужны Outlook/контакты)
-      * НЕ выключает Remote Assistance (для shadow session/поддержки)
-
-.EXAMPLE
-    .\Optimize-TerminalServer.ps1 -WhatIf
-    Показывает план без применения.
-
-.EXAMPLE
-    .\Optimize-TerminalServer.ps1
-    Применяет базовый набор (безопасный для всех).
-
-.EXAMPLE
-    .\Optimize-TerminalServer.ps1 -RemoveBloat -HardenTLS
-    Применяет всё + удаление Lightshot + жёсткий TLS.
-
-.NOTES
-    Запускать ОТ ИМЕНИ АДМИНИСТРАТОРА.
-    Версия: 3.2
-    Дата: 2026-05-03
-    Автор: TL Operations
-    История:
-      3.2 - ENCODING FIX: файл теперь UTF-8 with BOM (вместо UTF-16 LE BOM).
-            UTF-16 LE BOM иногда не распознавался PowerShell ISE/некоторыми
-            редакторами как BOM, в результате <# comment-help block парсился
-            как код и падал с "Отсутствует аргумент в списке параметров".
-            UTF-8 BOM универсально распознаётся PowerShell 5.1+ и всеми
-            Windows инструментами включая Notepad, Notepad++, PS ISE, VS Code.
-      3.1 - КРИТИЧНЫЙ FIX: Power Plan теперь VM-aware. На virtualized Windows
-            'High Performance' + IDLEDISABLE=1 ломал HLT -> vCPU thread в qemu
-            крутился 100% даже когда Windows idle (System Idle Process 99%).
-            Симптом: TS-BUH-W19 / TS-CLD-W19 после оптимизации показывали
-            host CPU 100% при пустом гостье. Теперь в VM выставляется Balanced
-            + IDLEDISABLE=0 (allow HLT). Bare-metal без изменений.
-      3.0 - Добавлен параметр -DisableTelemetry: глубокое отключение телеметрии
-            на основе Sophia Script + HushWin/BitLogiK best parts. Безопасно
-            для RDS - НЕ удаляет CompatTelRunner.exe, НЕ ломает per-user services.
-            Default User hive применяется ко всем НОВЫМ RDP-пользователям.
-            Office telemetry — только если Office установлен (детект).
-      2.1 - Hotfix: detect 3rd-party AV (Kaspersky/ESET) -> skip Defender sections
-            cleanly без ошибок 0x800106ba. WSearch COM tries multiple ProgIDs
-            (Microsoft.SearchManager + 3 fallback) — на WS2019 minimal класс
-            Microsoft.Search.Administration.SearchManager не зарегистрирован.
-      2.0 - Гибрид с torbik скриптом: RDP UDP/codec, Power Plan, Memory tuning,
-            Network TcpNoDelay, Event Log size, Temp Cleanup task, Recycle Bin,
-            опциональный TLS hardening и Account Lockout. AVC OFF по дефолту
-            (нет GPU на хостах). WSearch tune вместо disable.
-      1.1 - WSearch не отключаем (пользуются Explorer/Outlook search).
-      1.0 - Initial version.
-#>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(

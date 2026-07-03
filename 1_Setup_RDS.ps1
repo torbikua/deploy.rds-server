@@ -1,7 +1,7 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Windows Server 2025 — Terminal Server (RDS) setup without Active Directory domain.
+    Windows Server 2025 - Terminal Server (RDS) setup without Active Directory domain.
     INTERACTIVE edition.
 .DESCRIPTION
     1. Installs RDS roles (RD Session Host + RD Licensing)
@@ -17,7 +17,7 @@
     license-server activation, Session Host licensing mode + configured license
     server, RDP port, users, firewall) and asks whether to re-license.
     The 'not licensed' warning is fixed by pointing the RD Session Host at the
-    local license server via WMI (ChangeMode + SetSpecifiedLicenseServerList) —
+    local license server via WMI (ChangeMode + SetSpecifiedLicenseServerList) -
     not just registry policy. Diagnose anytime with lsdiag.msc.
 
     SAFE FOR RDP: when the port is changed, the current port stays open until you
@@ -25,7 +25,7 @@
 #>
 
 # ==============================
-#  CONFIGURATION — DEFAULTS
+#  CONFIGURATION - DEFAULTS
 #  (all of these can be overridden by the interactive prompts)
 # ==============================
 
@@ -162,7 +162,7 @@ function Set-SessionHostLicensing {
     param([int]$Mode, [string]$Server)
     $sh = Get-SessionHostLicensing
     if (-not $sh.Found -or -not $sh.Obj) {
-        Write-Host "[WARN] Win32_TerminalServiceSetting not available — cannot configure Session Host via WMI." -ForegroundColor Yellow
+        Write-Host "[WARN] Win32_TerminalServiceSetting not available - cannot configure Session Host via WMI." -ForegroundColor Yellow
         return $false
     }
     $ok = $true
@@ -281,7 +281,7 @@ Write-Host "      Firewall default inbound (Domain profile): $fwInbound" -Foregr
 
 # ==============================
 #  INTERACTIVE CONFIGURATION
-#  (asked only once — after roles are installed, no reboot pending)
+#  (asked only once - after roles are installed, no reboot pending)
 # ==============================
 
 Write-Step "INTERACTIVE SETUP"
@@ -308,7 +308,7 @@ if ($actState.Activated) {
     $ReLicense = Read-YesNo -Prompt "   Configure and activate licensing now?" -Default $true
 }
 
-# Always (re)point the Session Host at the local license server — safe & idempotent,
+# Always (re)point the Session Host at the local license server - safe & idempotent,
 # and it is the actual fix for the 'not licensed' warning. Only activation needs an EA.
 $DoActivate = $false
 $AgreementNumber = ""
@@ -377,7 +377,7 @@ else {
     Set-ItemProperty -Path $rdshPath -Name "LicenseServers" -Value $localhost -Type String
     Write-Host "[OK] Registry policy: mode=$licModeName, server=$localhost" -ForegroundColor Green
 
-    # 2b. THE ACTUAL FIX — configure the RD Session Host via WMI to use the
+    # 2b. THE ACTUAL FIX - configure the RD Session Host via WMI to use the
     #     local license server. Without this the host reports 'not licensed'.
     if (Set-SessionHostLicensing -Mode $LicensingMode -Server $localhost) {
         Write-Host "[OK] Session Host configured: mode=$licModeName, license server='$localhost'." -ForegroundColor Green
@@ -393,7 +393,7 @@ else {
             if ($wmiObj) {
                 $already = ([int]$wmiObj.GetActivationStatus().ActivationStatus -eq 0)
                 if ($already) {
-                    Write-Host "[INFO] License server already activated — re-activating on request." -ForegroundColor Yellow
+                    Write-Host "[INFO] License server already activated - re-activating on request." -ForegroundColor Yellow
                 }
                 Write-Host "[ACTIVATING] Using Enterprise Agreement: $AgreementNumber ..." -ForegroundColor Yellow
                 $result = $wmiObj.ActivateServerAutomatic()
@@ -420,7 +420,7 @@ else {
         Set-ItemProperty -Path $rdshPath -Name "EnterpriseAgreement" -Value $AgreementNumber -Type String
     }
     else {
-        Write-Host "[INFO] No EA number given — license server NOT (re)activated." -ForegroundColor Yellow
+        Write-Host "[INFO] No EA number given - license server NOT (re)activated." -ForegroundColor Yellow
         Write-Host "[INFO] Note: with Per-User CALs in a workgroup, sessions work but CALs are not tracked." -ForegroundColor Gray
     }
 
@@ -460,7 +460,7 @@ if ($CreateUsers -and $Users.Count -gt 0) {
 
         $existingUser = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
         if ($existingUser) {
-            Write-Host "[SKIP] User '$userName' already exists — resetting password." -ForegroundColor Yellow
+            Write-Host "[SKIP] User '$userName' already exists - resetting password." -ForegroundColor Yellow
             try {
                 $securePass = ConvertTo-SecureString $userPass -AsPlainText -Force
                 Set-LocalUser -Name $userName -Password $securePass -ErrorAction Stop
@@ -620,7 +620,7 @@ $infoFile = "$env:PUBLIC\Desktop\RDP-CONNECTION-INFO.txt"
 
 $oldPortNote
 
-  !!! SENSITIVE — contains passwords. Store securely, then delete. !!!
+  !!! SENSITIVE - contains passwords. Store securely, then delete. !!!
   Users (login / password):
 $userLines
 
@@ -631,7 +631,7 @@ $userLines
 
   Licensing:
     - Mode: $licModeName
-    - License server: $(if ($licActivatedNow) { "ACTIVATED ($localhost)" } else { "NOT activated — run licmgr.exe / lsdiag.msc" })
+    - License server: $(if ($licActivatedNow) { "ACTIVATED ($localhost)" } else { "NOT activated - run licmgr.exe / lsdiag.msc" })
     - EA: $(if ($AgreementNumber) { $AgreementNumber } else { "(none provided)" })
 
 ==========================================
@@ -704,22 +704,22 @@ if ($licActivatedNow) {
 Write-Host ""
 
 Write-Host "  [!] Credentials + connection info saved to: $infoFile" -ForegroundColor Cyan
-Write-Host "  [!] That file contains PASSWORDS — store it securely and delete afterwards." -ForegroundColor Red
+Write-Host "  [!] That file contains PASSWORDS - store it securely and delete afterwards." -ForegroundColor Red
 Write-Host ""
 
 if ($ChangePort -and $OldPort -ne $NewPort) {
     Write-Host "  [!] SAVE THIS PORT: $NewPort" -ForegroundColor Red
     Write-Host ""
-    Write-Host "  ┌─────────────────────────────────────────────────┐" -ForegroundColor Yellow
-    Write-Host "  │  Restarting TermService in 10 seconds...        │" -ForegroundColor Yellow
-    Write-Host "  │  Your RDP session WILL disconnect.              │" -ForegroundColor Yellow
-    Write-Host "  │  Reconnect using the NEW port above.            │" -ForegroundColor Green
-    Write-Host "  └─────────────────────────────────────────────────┘" -ForegroundColor Yellow
+    Write-Host "  +-------------------------------------------------+" -ForegroundColor Yellow
+    Write-Host "  |  Restarting TermService in 10 seconds...        |" -ForegroundColor Yellow
+    Write-Host "  |  Your RDP session WILL disconnect.              |" -ForegroundColor Yellow
+    Write-Host "  |  Reconnect using the NEW port above.            |" -ForegroundColor Green
+    Write-Host "  +-------------------------------------------------+" -ForegroundColor Yellow
     Write-Host ""
     Start-Sleep -Seconds 10
     Restart-Service -Name "TermService" -Force
 }
 else {
-    Write-Host "  [OK] RDP port unchanged — no service restart needed." -ForegroundColor Green
+    Write-Host "  [OK] RDP port unchanged - no service restart needed." -ForegroundColor Green
     Write-Host "  [OK] Setup finished." -ForegroundColor Green
 }

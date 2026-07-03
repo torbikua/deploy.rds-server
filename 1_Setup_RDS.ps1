@@ -13,8 +13,12 @@
     6. Prints a full report including generated user credentials
 .NOTES
     Run as Administrator. Server will REBOOT after role installation.
-    After reboot, run the script again — roles are skipped and the interactive
-    setup runs exactly once (questions are asked only when no reboot is pending).
+    RE-RUNNABLE: on every run it prints a CURRENT STATE inventory (roles,
+    license-server activation, Session Host licensing mode + configured license
+    server, RDP port, users, firewall) and asks whether to re-license.
+    The 'not licensed' warning is fixed by pointing the RD Session Host at the
+    local license server via WMI (ChangeMode + SetSpecifiedLicenseServerList) —
+    not just registry policy. Diagnose anytime with lsdiag.msc.
 
     SAFE FOR RDP: when the port is changed, the current port stays open until you
     reconnect on the new port; a scheduled task locks down the old port afterwards.
@@ -125,6 +129,64 @@ function Get-RandomPort {
     return $port
 }
 
+# --- Licensing helpers ---------------------------------------------------
+
+function Get-LicenseServerActivation {
+    # Returns @{ Found=bool; Activated=bool; Code=int }
+    try {
+        $ls = Get-WmiObject -Namespace "root\cimv2" -Class "Win32_TSLicenseServer" -ErrorAction Stop
+        if ($ls) {
+            $code = [int]($ls.GetActivationStatus().ActivationStatus)  # 0 = activated, 1 = not
+            return @{ Found = $true; Activated = ($code -eq 0); Code = $code }
+        }
+    } catch {}
+    return @{ Found = $false; Activated = $false; Code = -1 }
+}
+
+function Get-SessionHostLicensing {
+    # Reads the ACTUAL RD Session Host config (what really controls the nag).
+    # LicensingType: 2 = Per Device, 4 = Per User, 5 = Not configured.
+    try {
+        $ts = Get-WmiObject -Namespace "root\cimv2\terminalservices" -Class "Win32_TerminalServiceSetting" -ErrorAction Stop
+        $servers = @()
+        try { $servers = @($ts.GetSpecifiedLicenseServerList().SpecifiedLSList) } catch {}
+        return @{ Found = $true; Mode = [int]$ts.LicensingType; Servers = $servers; Obj = $ts }
+    } catch {
+        return @{ Found = $false; Mode = -1; Servers = @(); Obj = $null }
+    }
+}
+
+function Set-SessionHostLicensing {
+    # Points the Session Host at a license server and sets the mode.
+    # THIS is what clears "RD licensing is not configured / not licensed".
+    param([int]$Mode, [string]$Server)
+    $sh = Get-SessionHostLicensing
+    if (-not $sh.Found -or -not $sh.Obj) {
+        Write-Host "[WARN] Win32_TerminalServiceSetting not available — cannot configure Session Host via WMI." -ForegroundColor Yellow
+        return $false
+    }
+    $ok = $true
+    try {
+        $r1 = $sh.Obj.ChangeMode($Mode)
+        if ($r1.ReturnValue -ne 0) { Write-Host "[WARN] ChangeMode returned $($r1.ReturnValue)." -ForegroundColor Yellow; $ok = $false }
+    } catch { Write-Host "[WARN] ChangeMode failed: $_" -ForegroundColor Yellow; $ok = $false }
+    try {
+        $r2 = $sh.Obj.SetSpecifiedLicenseServerList($Server)
+        if ($r2.ReturnValue -ne 0) { Write-Host "[WARN] SetSpecifiedLicenseServerList returned $($r2.ReturnValue)." -ForegroundColor Yellow; $ok = $false }
+    } catch { Write-Host "[WARN] SetSpecifiedLicenseServerList failed: $_" -ForegroundColor Yellow; $ok = $false }
+    return $ok
+}
+
+function Get-LicensingModeName {
+    param([int]$Mode)
+    switch ($Mode) {
+        2 { "Per Device" }
+        4 { "Per User" }
+        5 { "Not configured" }
+        default { "Unknown ($Mode)" }
+    }
+}
+
 # ==============================
 #  STEP 1: Install RDS Roles
 # ==============================
@@ -166,6 +228,58 @@ if ($needReboot) {
 }
 
 # ==============================
+#  CURRENT STATE / INVENTORY
+#  (re-run friendly: shows what is already configured)
+# ==============================
+
+Write-Step "CURRENT STATE (what is already configured)"
+
+$localhost = $env:COMPUTERNAME
+
+# Roles
+foreach ($role in $rolesToInstall) {
+    $inst = (Get-WindowsFeature -Name $role).Installed
+    $tag  = if ($inst) { "[OK]  " } else { "[--]  " }
+    $clr  = if ($inst) { "Green" } else { "Yellow" }
+    Write-Host "$tag Role $role : $(if($inst){'installed'}else{'MISSING'})" -ForegroundColor $clr
+}
+
+# Licensing state
+$actState = Get-LicenseServerActivation
+$shState  = Get-SessionHostLicensing
+Write-Host ""
+if ($actState.Found) {
+    if ($actState.Activated) {
+        Write-Host "[OK]  License server : ACTIVATED" -ForegroundColor Green
+    } else {
+        Write-Host "[!!]  License server : NOT activated (code $($actState.Code))" -ForegroundColor Red
+    }
+} else {
+    Write-Host "[!!]  License server : WMI object not found (role not ready?)" -ForegroundColor Red
+}
+if ($shState.Found) {
+    $modeName = Get-LicensingModeName -Mode $shState.Mode
+    $srvList  = if ($shState.Servers.Count) { $shState.Servers -join ", " } else { "(none)" }
+    $modeClr  = if ($shState.Mode -eq 5 -or $shState.Mode -lt 0) { "Red" } else { "Green" }
+    Write-Host "      Session Host mode : $modeName" -ForegroundColor $modeClr
+    $srvClr = if ($shState.Servers.Count) { "Green" } else { "Red" }
+    Write-Host "      License server(s) configured on host : $srvList" -ForegroundColor $srvClr
+}
+
+# Current RDP port + users + firewall
+$rdpPortPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+$curPort = (Get-ItemProperty -Path $rdpPortPath -Name "PortNumber" -ErrorAction SilentlyContinue).PortNumber
+Write-Host ""
+Write-Host "      Current RDP port : $curPort" -ForegroundColor White
+try {
+    $rdpGrpName = (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-555")).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+    $rdpMembers = @(Get-LocalGroupMember -Group $rdpGrpName -ErrorAction SilentlyContinue | ForEach-Object { $_.Name.Split('\')[-1] })
+    Write-Host "      RDP users ($rdpGrpName): $(if($rdpMembers.Count){$rdpMembers -join ', '}else{'(none)'})" -ForegroundColor White
+} catch {}
+$fwInbound = (Get-NetFirewallProfile -Profile Domain).DefaultInboundAction
+Write-Host "      Firewall default inbound (Domain profile): $fwInbound" -ForegroundColor White
+
+# ==============================
 #  INTERACTIVE CONFIGURATION
 #  (asked only once — after roles are installed, no reboot pending)
 # ==============================
@@ -175,14 +289,47 @@ Write-Step "INTERACTIVE SETUP"
 Write-Host "Answer the questions below. Press Enter to accept the [default]." -ForegroundColor Gray
 Write-Host ""
 
-# --- Q1: Enterprise Agreement number ---
-Write-Host "1) RD Licensing — Enterprise Agreement" -ForegroundColor Cyan
-$AgreementNumber = Read-Default -Prompt "   Enter Enterprise Agreement number (blank = activate later manually)" -Default ""
-$DoActivate = -not [string]::IsNullOrWhiteSpace($AgreementNumber)
-if ($DoActivate) {
-    Write-Host "   -> Will activate with EA: $AgreementNumber" -ForegroundColor Green
+# --- Q1: RD Licensing (re-run aware) ---
+Write-Host "1) RD Licensing" -ForegroundColor Cyan
+
+$licNeedsWork = -not $actState.Activated -or -not $shState.Found -or $shState.Mode -eq 5 -or $shState.Mode -lt 0 -or $shState.Servers.Count -eq 0
+
+if ($actState.Activated) {
+    Write-Host "   License server is ALREADY activated." -ForegroundColor Green
+    if (-not $licNeedsWork) {
+        Write-Host "   Session Host is already pointed at a license server ($($shState.Servers -join ', '))." -ForegroundColor Green
+    } else {
+        Write-Host "   BUT the Session Host licensing config looks incomplete (this causes 'not licensed')." -ForegroundColor Yellow
+    }
+    # Default: re-configure only if something is off
+    $ReLicense = Read-YesNo -Prompt "   Re-configure / re-activate licensing now?" -Default $licNeedsWork
 } else {
-    Write-Host "   -> Skipping automatic activation (do it later via licmgr.exe)." -ForegroundColor Yellow
+    Write-Host "   License server is NOT activated (or role not fully ready)." -ForegroundColor Red
+    $ReLicense = Read-YesNo -Prompt "   Configure and activate licensing now?" -Default $true
+}
+
+# Always (re)point the Session Host at the local license server — safe & idempotent,
+# and it is the actual fix for the 'not licensed' warning. Only activation needs an EA.
+$DoActivate = $false
+$AgreementNumber = ""
+if ($ReLicense) {
+    if (-not $actState.Activated) {
+        $AgreementNumber = Read-Default -Prompt "   Enter Enterprise Agreement number (blank = skip activation)" -Default ""
+        $DoActivate = -not [string]::IsNullOrWhiteSpace($AgreementNumber)
+    } else {
+        $reActivate = Read-YesNo -Prompt "   Re-activate the license server via a (new) EA number?" -Default $false
+        if ($reActivate) {
+            $AgreementNumber = Read-Default -Prompt "   Enter Enterprise Agreement number" -Default ""
+            $DoActivate = -not [string]::IsNullOrWhiteSpace($AgreementNumber)
+        }
+    }
+    if ($DoActivate) {
+        Write-Host "   -> Will (re)activate with EA: $AgreementNumber and reconfigure Session Host." -ForegroundColor Green
+    } else {
+        Write-Host "   -> Will reconfigure Session Host to use local license server (no re-activation)." -ForegroundColor Green
+    }
+} else {
+    Write-Host "   -> Leaving licensing as-is." -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -217,28 +364,37 @@ Write-Host ""
 
 Write-Step "STEP 2: Configuring RD Licensing"
 
-$localhost = $env:COMPUTERNAME
-
 $rdshPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-if (-not (Test-Path $rdshPath)) {
-    New-Item -Path $rdshPath -Force | Out-Null
+$licModeName = Get-LicensingModeName -Mode $LicensingMode
+
+if (-not $ReLicense) {
+    Write-Host "[SKIP] Licensing left unchanged by choice." -ForegroundColor Yellow
 }
-Set-ItemProperty -Path $rdshPath -Name "LicensingMode" -Value $LicensingMode -Type DWord
-Set-ItemProperty -Path $rdshPath -Name "LicenseServers" -Value $localhost -Type String
+else {
+    # 2a. GPO-style registry hints (belt-and-suspenders)
+    if (-not (Test-Path $rdshPath)) { New-Item -Path $rdshPath -Force | Out-Null }
+    Set-ItemProperty -Path $rdshPath -Name "LicensingMode"  -Value $LicensingMode -Type DWord
+    Set-ItemProperty -Path $rdshPath -Name "LicenseServers" -Value $localhost -Type String
+    Write-Host "[OK] Registry policy: mode=$licModeName, server=$localhost" -ForegroundColor Green
 
-$licModeName = if ($LicensingMode -eq 4) { "Per User" } else { "Per Device" }
-Write-Host "[OK] Licensing mode set to $licModeName (local server: $localhost)" -ForegroundColor Green
+    # 2b. THE ACTUAL FIX — configure the RD Session Host via WMI to use the
+    #     local license server. Without this the host reports 'not licensed'.
+    if (Set-SessionHostLicensing -Mode $LicensingMode -Server $localhost) {
+        Write-Host "[OK] Session Host configured: mode=$licModeName, license server='$localhost'." -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] Could not fully configure Session Host via WMI (see warnings above)." -ForegroundColor Yellow
+    }
 
-if ($DoActivate) {
-    Write-Step "STEP 2b: Activating License Server (Enterprise Agreement)"
-    try {
-        $wmiObj = Get-WmiObject -Namespace "root\cimv2" -Class "Win32_TSLicenseServer" -ErrorAction Stop
-        if ($wmiObj) {
-            $activationStatus = $wmiObj.GetActivationStatus()
-            if ($activationStatus.ActivationStatus -eq 0) {
-                Write-Host "[OK] License server is already activated." -ForegroundColor Green
-            }
-            else {
+    # 2c. Activate the license server (only when an EA number was provided)
+    if ($DoActivate) {
+        Write-Step "STEP 2b: Activating License Server (Enterprise Agreement)"
+        try {
+            $wmiObj = Get-WmiObject -Namespace "root\cimv2" -Class "Win32_TSLicenseServer" -ErrorAction Stop
+            if ($wmiObj) {
+                $already = ([int]$wmiObj.GetActivationStatus().ActivationStatus -eq 0)
+                if ($already) {
+                    Write-Host "[INFO] License server already activated — re-activating on request." -ForegroundColor Yellow
+                }
                 Write-Host "[ACTIVATING] Using Enterprise Agreement: $AgreementNumber ..." -ForegroundColor Yellow
                 $result = $wmiObj.ActivateServerAutomatic()
                 if ($result.ReturnValue -eq 0) {
@@ -249,25 +405,40 @@ if ($DoActivate) {
                     Write-Host "[INFO] Activate manually: licmgr.exe -> Activate Server -> Enterprise Agreement -> $AgreementNumber" -ForegroundColor Yellow
                 }
             }
+            else {
+                Write-Host "[WARN] WMI object Win32_TSLicenseServer not found." -ForegroundColor Yellow
+            }
         }
-        else {
-            Write-Host "[WARN] WMI object Win32_TSLicenseServer not found." -ForegroundColor Yellow
-            Write-Host "[INFO] Activate manually: licmgr.exe -> Activate Server -> Enterprise Agreement -> $AgreementNumber" -ForegroundColor Yellow
+        catch {
+            Write-Host "[WARN] Could not query license server WMI: $_" -ForegroundColor Yellow
+            Write-Host "[INFO] === MANUAL ACTIVATION ===" -ForegroundColor Yellow
+            Write-Host "[INFO] 1. licmgr.exe -> right-click server -> Activate Server" -ForegroundColor White
+            Write-Host "[INFO] 2. Method: Automatic; Program: Enterprise Agreement" -ForegroundColor White
+            Write-Host "[INFO] 3. Agreement Number: $AgreementNumber" -ForegroundColor White
+            Write-Host "[INFO] 4. Install Licenses -> Enterprise Agreement -> RDS Per User CALs" -ForegroundColor White
         }
+        Set-ItemProperty -Path $rdshPath -Name "EnterpriseAgreement" -Value $AgreementNumber -Type String
     }
-    catch {
-        Write-Host "[WARN] Could not query license server WMI: $_" -ForegroundColor Yellow
-        Write-Host "[INFO] === MANUAL ACTIVATION ===" -ForegroundColor Yellow
-        Write-Host "[INFO] 1. licmgr.exe -> right-click server -> Activate Server" -ForegroundColor White
-        Write-Host "[INFO] 2. Method: Automatic; Program: Enterprise Agreement" -ForegroundColor White
-        Write-Host "[INFO] 3. Agreement Number: $AgreementNumber" -ForegroundColor White
-        Write-Host "[INFO] 4. Install Licenses -> Enterprise Agreement -> RDS Per User CALs" -ForegroundColor White
+    else {
+        Write-Host "[INFO] No EA number given — license server NOT (re)activated." -ForegroundColor Yellow
+        Write-Host "[INFO] Note: with Per-User CALs in a workgroup, sessions work but CALs are not tracked." -ForegroundColor Gray
     }
-    Set-ItemProperty -Path $rdshPath -Name "EnterpriseAgreement" -Value $AgreementNumber -Type String
+
+    # 2d. Post-config diagnostic
+    Write-Host ""
+    Write-Host "[DIAG] Licensing after configuration:" -ForegroundColor Cyan
+    $act2 = Get-LicenseServerActivation
+    $sh2  = Get-SessionHostLicensing
+    Write-Host ("       License server activated : {0}" -f $(if($act2.Activated){'YES'}else{'NO'})) -ForegroundColor $(if($act2.Activated){'Green'}else{'Yellow'})
+    if ($sh2.Found) {
+        Write-Host ("       Session Host mode        : {0}" -f (Get-LicensingModeName -Mode $sh2.Mode)) -ForegroundColor Green
+        Write-Host ("       License server on host   : {0}" -f $(if($sh2.Servers.Count){$sh2.Servers -join ', '}else{'(none)'})) -ForegroundColor $(if($sh2.Servers.Count){'Green'}else{'Red'})
+    }
+    Write-Host "[INFO] Full diagnosis GUI: run  lsdiag.msc  (RD Licensing Diagnoser)." -ForegroundColor Gray
 }
-else {
-    Write-Host "[INFO] Activation skipped. Run licmgr.exe later to activate via Enterprise Agreement." -ForegroundColor Yellow
-}
+
+# Remember effective activation state for the final report
+$licActivatedNow = (Get-LicenseServerActivation).Activated
 
 # ==============================
 #  STEP 3: Create Local Users
@@ -460,7 +631,8 @@ $userLines
 
   Licensing:
     - Mode: $licModeName
-    - EA: $(if ($DoActivate) { $AgreementNumber } else { "(not activated — do it via licmgr.exe)" })
+    - License server: $(if ($licActivatedNow) { "ACTIVATED ($localhost)" } else { "NOT activated — run licmgr.exe / lsdiag.msc" })
+    - EA: $(if ($AgreementNumber) { $AgreementNumber } else { "(none provided)" })
 
 ==========================================
 "@ | Set-Content -Path $infoFile -Encoding UTF8
@@ -522,11 +694,12 @@ Write-Host ""
 
 Write-Host "  LICENSING:" -ForegroundColor White
 Write-Host "    - Mode: $licModeName" -ForegroundColor White
-if ($DoActivate) {
-    Write-Host "    - EA Number: $AgreementNumber" -ForegroundColor White
-    Write-Host "    - If not auto-activated, run: licmgr.exe" -ForegroundColor Yellow
+if ($licActivatedNow) {
+    Write-Host "    - License server: ACTIVATED ($localhost)" -ForegroundColor Green
+    if ($AgreementNumber) { Write-Host "    - EA Number: $AgreementNumber" -ForegroundColor White }
 } else {
-    Write-Host "    - NOT activated — run licmgr.exe and use Enterprise Agreement" -ForegroundColor Yellow
+    Write-Host "    - License server: NOT activated" -ForegroundColor Yellow
+    Write-Host "    - Activate: licmgr.exe (Enterprise Agreement); diagnose: lsdiag.msc" -ForegroundColor Yellow
 }
 Write-Host ""
 

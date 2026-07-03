@@ -192,30 +192,46 @@ function Set-SessionHostLicensing {
 }
 
 function Invoke-LicenseServerActivate {
-    # Activates the license server over the Internet. Requires contact info.
-    param([string]$FirstName, [string]$LastName, [string]$Company, [string]$Country)
-    $ls = Get-TSLicenseServerCim
-    if (-not $ls) { return @{ ok = $false; msg = "Win32_TSLicenseServer not available (is the 'Remote Desktop Licensing' service running?)" } }
-    # Set required contact properties: try CIM, fall back to WMI .Put().
+    # Activates the license server over the Internet.
+    # FirstName/LastName/Company/CountryRegion are REQUIRED; eMail is optional
+    # (the licmgr GUI asks for it on the 2nd "Company Information" page).
+    # Win32_TSLicenseServer is a SINGLETON: it must be fetched via the "=@" path
+    # so that .Put() works. Plain Get-WmiObject/Get-CimInstance gives an instance
+    # whose .Put() fails with "Invalid parameter" on Server 2022/2025.
+    param(
+        [string]$FirstName, [string]$LastName, [string]$Company,
+        [string]$Country,   [string]$Email = ""
+    )
     try {
-        Set-CimInstance -InputObject $ls -Property @{
-            FirstName = $FirstName; LastName = $LastName; Company = $Company; CountryRegion = $Country
-        } -ErrorAction Stop
+        $ls = [wmi]"\\.\root\cimv2:Win32_TSLicenseServer=@"
     } catch {
-        try {
-            $w = Get-WmiObject -Namespace "root\cimv2" -Class "Win32_TSLicenseServer" -ErrorAction Stop
-            $w.FirstName = $FirstName; $w.LastName = $LastName; $w.Company = $Company; $w.CountryRegion = $Country
-            $w.Put() | Out-Null
-        } catch {
-            return @{ ok = $false; msg = "Could not set contact properties (needed for activation): $($_.Exception.Message)" }
-        }
+        return @{ ok = $false; msg = "Win32_TSLicenseServer not available (is the 'Remote Desktop Licensing' service running?)" }
     }
-    $ls = Get-TSLicenseServerCim
     try {
-        $r  = Invoke-CimMethod -InputObject $ls -MethodName "ActivateServerAutomatic" -ErrorAction Stop
-        $rv = [int]$r.ReturnValue; $st = [int]$r.ActivationStatus
-        if ($rv -eq 0 -and $st -eq 0) { return @{ ok = $true;  msg = "Activated." } }
-        return @{ ok = $false; msg = "ReturnValue=$rv, ActivationStatus=$st (see RDS WMI provider error codes)" }
+        $ls.FirstName     = $FirstName
+        $ls.LastName      = $LastName
+        $ls.Company       = $Company
+        $ls.CountryRegion = $Country
+        if ($Email) { $ls.eMail = $Email }
+        $ls.Put() | Out-Null
+    } catch {
+        return @{ ok = $false; msg = "Could not set contact properties (needed for activation): $($_.Exception.Message)" }
+    }
+    # Activate on the same singleton object.
+    try {
+        $r  = $ls.ActivateServerAutomatic()
+        $rv = [int]$r.ReturnValue
+        $st = [int]$r.ActivationStatus
+        if ($rv -eq 0 -and $st -eq 0) { return @{ ok = $true; msg = "Activated." } }
+        # Fallback: try via CIM in case the WMI adapter mis-handled the [out] param
+        try {
+            $lc = Get-TSLicenseServerCim
+            $r2 = Invoke-CimMethod -InputObject $lc -MethodName "ActivateServerAutomatic" -ErrorAction Stop
+            if ([int]$r2.ReturnValue -eq 0 -and [int]$r2.ActivationStatus -eq 0) { return @{ ok = $true; msg = "Activated." } }
+            return @{ ok = $false; msg = "ReturnValue=$([int]$r2.ReturnValue), ActivationStatus=$([int]$r2.ActivationStatus)" }
+        } catch {
+            return @{ ok = $false; msg = "ReturnValue=$rv, ActivationStatus=$st (automatic clearinghouse may be unreachable)" }
+        }
     } catch {
         return @{ ok = $false; msg = "ActivateServerAutomatic failed: $($_.Exception.Message)" }
     }
@@ -391,7 +407,7 @@ $CalCount = 0
 $CalAgreementType = 1   # 1 = Enterprise Agreement
 $CalProductType   = if ($LicensingMode -eq 2) { 0 } else { 1 }   # 0=Per Device, 1=Per User
 $CalProductVersion = Get-CalProductVersion
-$ActFirst = ""; $ActLast = ""; $ActCompany = ""; $ActCountry = ""
+$ActFirst = ""; $ActLast = ""; $ActCompany = ""; $ActCountry = ""; $ActEmail = ""
 
 if ($ReLicense) {
     # B) Activation
@@ -402,6 +418,7 @@ if ($ReLicense) {
         $ActLast    = Read-Default -Prompt "     Last name"  -Default "Admin"
         $ActCompany = Read-Default -Prompt "     Company"    -Default "Company"
         $ActCountry = Read-Default -Prompt "     Country/Region (e.g. US, GB, UA, DE)" -Default "US"
+        $ActEmail   = Read-Default -Prompt "     Email (optional, Enter to skip)" -Default ""
     }
 
     # C) CAL installation from an agreement
@@ -473,8 +490,8 @@ else {
     # 2b. Activate the license server (contact info required; needs Internet)
     if ($DoActivate) {
         Write-Step "STEP 2b: Activating License Server (over the Internet)"
-        Write-Host "[ACTIVATING] Contact: $ActFirst $ActLast / $ActCompany / $ActCountry ..." -ForegroundColor Yellow
-        $act = Invoke-LicenseServerActivate -FirstName $ActFirst -LastName $ActLast -Company $ActCompany -Country $ActCountry
+        Write-Host "[ACTIVATING] Contact: $ActFirst $ActLast / $ActCompany / $ActCountry$(if($ActEmail){" / $ActEmail"}) ..." -ForegroundColor Yellow
+        $act = Invoke-LicenseServerActivate -FirstName $ActFirst -LastName $ActLast -Company $ActCompany -Country $ActCountry -Email $ActEmail
         if ($act.ok) {
             Write-Host "[OK] License server activated." -ForegroundColor Green
         } else {

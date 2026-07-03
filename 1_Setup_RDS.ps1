@@ -2,45 +2,45 @@
 <#
 .SYNOPSIS
     Windows Server 2025 — Terminal Server (RDS) setup without Active Directory domain.
+    INTERACTIVE edition.
 .DESCRIPTION
     1. Installs RDS roles (RD Session Host + RD Licensing)
-    2. Activates RD Licensing via Enterprise Agreement
-    3. Creates local users for RDP access
-    4. Changes default RDP port to a random port
-    5. Hardens Windows Firewall: blocks everything, allows only ICMP (ping) + custom RDP port
+    2. Asks for the Enterprise Agreement number and activates RD Licensing
+    3. Asks whether to change the RDP port to a random one
+    4. Asks whether to create local users, how many, proposes default names
+       (u.01, u.02, ...) and auto-generates strong passwords
+    5. Hardens Windows Firewall: blocks everything, allows only ICMP (ping) + RDP port
+    6. Prints a full report including generated user credentials
 .NOTES
     Run as Administrator. Server will REBOOT after role installation.
-    After reboot, run the script again — it will skip already-installed roles and continue setup.
-    
-    SAFE FOR RDP: the script keeps the current port open until you reconnect on the new port.
-    A scheduled task will lock down the old port after a grace period.
+    After reboot, run the script again — roles are skipped and the interactive
+    setup runs exactly once (questions are asked only when no reboot is pending).
+
+    SAFE FOR RDP: when the port is changed, the current port stays open until you
+    reconnect on the new port; a scheduled task locks down the old port afterwards.
 #>
 
 # ==============================
-#  CONFIGURATION — EDIT HERE
+#  CONFIGURATION — DEFAULTS
+#  (all of these can be overridden by the interactive prompts)
 # ==============================
-
-# Local users to create (username = password pairs)
-# !! CHANGE PASSWORDS BEFORE RUNNING !!
-$Users = @(
-    @{ Name = "u01";  Password = "***_CHANGE_ME_***" }
-    @{ Name = "u02";  Password = "***_CHANGE_ME_***" }
-    @{ Name = "u03";  Password = "***_CHANGE_ME_***" }
-    # Add more users as needed:
-    # @{ Name = "user4";  Password = "SecurePass!444" }
-)
-
-# Enterprise Agreement number for RDS CAL activation
-# Replace with your real EA number
-$AgreementNumber = "***_CHANGE_ME_***"
 
 # RDP port range for random generation (high ports to avoid conflicts)
 $PortRangeMin = 10000
 $PortRangeMax = 59999
 
-# Grace period (minutes) before old RDP port (3389) is closed in firewall.
-# This gives you time to reconnect on the new port after TermService restarts.
+# Grace period (minutes) before the OLD RDP port is closed in the firewall.
 $FirewallGraceMinutes = 5
+
+# Default prefix and length for auto-generated user names (u.01, u.02, ...)
+$DefaultUserPrefix = "u."
+$DefaultUserCount  = 3
+
+# Generated password length
+$PasswordLength = 16
+
+# Licensing mode: 4 = Per User, 2 = Per Device
+$LicensingMode = 4
 
 # ==============================
 #  FUNCTIONS
@@ -51,6 +51,69 @@ function Write-Step {
     Write-Host "`n========================================" -ForegroundColor Cyan
     Write-Host "  $Message" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
+}
+
+function Read-YesNo {
+    # Returns $true / $false. $Default is used on empty input.
+    param([string]$Prompt, [bool]$Default = $true)
+    $suffix = if ($Default) { "[Y/n]" } else { "[y/N]" }
+    while ($true) {
+        $ans = (Read-Host "$Prompt $suffix").Trim().ToLower()
+        if ([string]::IsNullOrEmpty($ans)) { return $Default }
+        switch ($ans) {
+            'y'   { return $true }
+            'yes' { return $true }
+            'n'   { return $false }
+            'no'  { return $false }
+            default { Write-Host "  Please answer y or n." -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Read-Default {
+    # Prompt with a default value shown; Enter accepts the default.
+    param([string]$Prompt, [string]$Default = "")
+    if ($Default) {
+        $ans = Read-Host "$Prompt [$Default]"
+    } else {
+        $ans = Read-Host "$Prompt"
+    }
+    if ([string]::IsNullOrWhiteSpace($ans)) { return $Default }
+    return $ans.Trim()
+}
+
+function Read-IntInRange {
+    param([string]$Prompt, [int]$Default, [int]$Min = 1, [int]$Max = 999)
+    while ($true) {
+        $ans = (Read-Host "$Prompt [$Default]").Trim()
+        if ([string]::IsNullOrEmpty($ans)) { return $Default }
+        $n = 0
+        if ([int]::TryParse($ans, [ref]$n) -and $n -ge $Min -and $n -le $Max) { return $n }
+        Write-Host "  Enter a number between $Min and $Max." -ForegroundColor Yellow
+    }
+}
+
+function New-RandomPassword {
+    # Strong password with guaranteed complexity: >=1 upper, lower, digit, symbol.
+    # Ambiguous characters (O/0, l/1/I) are excluded for readability.
+    param([int]$Length = 16)
+    $upper  = "ABCDEFGHJKMNPQRSTUVWXYZ".ToCharArray()
+    $lower  = "abcdefghijkmnpqrstuvwxyz".ToCharArray()
+    $digit  = "23456789".ToCharArray()
+    $symbol = "!@#$%^&*-_=+".ToCharArray()
+    $all    = $upper + $lower + $digit + $symbol
+
+    # guarantee one of each class
+    $chars = @(
+        $upper  | Get-Random
+        $lower  | Get-Random
+        $digit  | Get-Random
+        $symbol | Get-Random
+    )
+    for ($i = $chars.Count; $i -lt $Length; $i++) { $chars += ($all | Get-Random) }
+    # shuffle
+    $chars = $chars | Sort-Object { Get-Random }
+    return -join $chars
 }
 
 function Get-RandomPort {
@@ -95,6 +158,7 @@ foreach ($role in $rolesToInstall) {
 if ($needReboot) {
     Write-Host "`n[!] Reboot required to complete role installation." -ForegroundColor Red
     Write-Host "[!] After reboot, run this script again to continue setup." -ForegroundColor Red
+    Write-Host "[!] The interactive questions will be asked AFTER the reboot." -ForegroundColor Yellow
     Write-Host "[!] Rebooting in 15 seconds..." -ForegroundColor Red
     Start-Sleep -Seconds 15
     Restart-Computer -Force
@@ -102,18 +166,59 @@ if ($needReboot) {
 }
 
 # ==============================
+#  INTERACTIVE CONFIGURATION
+#  (asked only once — after roles are installed, no reboot pending)
+# ==============================
+
+Write-Step "INTERACTIVE SETUP"
+
+Write-Host "Answer the questions below. Press Enter to accept the [default]." -ForegroundColor Gray
+Write-Host ""
+
+# --- Q1: Enterprise Agreement number ---
+Write-Host "1) RD Licensing — Enterprise Agreement" -ForegroundColor Cyan
+$AgreementNumber = Read-Default -Prompt "   Enter Enterprise Agreement number (blank = activate later manually)" -Default ""
+$DoActivate = -not [string]::IsNullOrWhiteSpace($AgreementNumber)
+if ($DoActivate) {
+    Write-Host "   -> Will activate with EA: $AgreementNumber" -ForegroundColor Green
+} else {
+    Write-Host "   -> Skipping automatic activation (do it later via licmgr.exe)." -ForegroundColor Yellow
+}
+Write-Host ""
+
+# --- Q2: Change RDP port? ---
+Write-Host "2) RDP Port" -ForegroundColor Cyan
+$ChangePort = Read-YesNo -Prompt "   Change RDP port to a RANDOM high port?" -Default $true
+Write-Host ""
+
+# --- Q3: Create users? ---
+Write-Host "3) Local RDP users" -ForegroundColor Cyan
+$CreateUsers = Read-YesNo -Prompt "   Create local users for RDP?" -Default $true
+$Users = @()
+if ($CreateUsers) {
+    $userCount = Read-IntInRange -Prompt "   How many users?" -Default $DefaultUserCount -Min 1 -Max 200
+    $prefix    = Read-Default   -Prompt "   Username prefix" -Default $DefaultUserPrefix
+    Write-Host "   Proposing default names ($prefix01 ...). Press Enter to accept each, or type a different name." -ForegroundColor Gray
+    for ($i = 1; $i -le $userCount; $i++) {
+        $defaultName = "{0}{1:D2}" -f $prefix, $i
+        $name = Read-Default -Prompt "     User #$i name" -Default $defaultName
+        $pass = New-RandomPassword -Length $PasswordLength
+        $Users += @{ Name = $name; Password = $pass }
+    }
+    Write-Host "   -> $($Users.Count) user(s) queued; passwords auto-generated." -ForegroundColor Green
+} else {
+    Write-Host "   -> No users will be created." -ForegroundColor Yellow
+}
+Write-Host ""
+
+# ==============================
 #  STEP 2: Configure RD Licensing
 # ==============================
 
 Write-Step "STEP 2: Configuring RD Licensing"
 
-# Set licensing mode to Per User (4) — change to 2 for Per Device
-$LicensingMode = 4  # 4 = Per User, 2 = Per Device
-
-# Configure RD Session Host to use local license server
 $localhost = $env:COMPUTERNAME
 
-# Set licensing mode via registry
 $rdshPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
 if (-not (Test-Path $rdshPath)) {
     New-Item -Path $rdshPath -Force | Out-Null
@@ -121,238 +226,215 @@ if (-not (Test-Path $rdshPath)) {
 Set-ItemProperty -Path $rdshPath -Name "LicensingMode" -Value $LicensingMode -Type DWord
 Set-ItemProperty -Path $rdshPath -Name "LicenseServers" -Value $localhost -Type String
 
-Write-Host "[OK] Licensing mode set to Per User (local server: $localhost)" -ForegroundColor Green
+$licModeName = if ($LicensingMode -eq 4) { "Per User" } else { "Per Device" }
+Write-Host "[OK] Licensing mode set to $licModeName (local server: $localhost)" -ForegroundColor Green
 
-# Activate License Server via Enterprise Agreement using WMI
-Write-Step "STEP 2b: Activating License Server (Enterprise Agreement)"
-
-try {
-    $wmiObj = Get-WmiObject -Namespace "root\cimv2" -Class "Win32_TSLicenseServer" -ErrorAction Stop
-
-    if ($wmiObj) {
-        $activationStatus = $wmiObj.GetActivationStatus()
-        # 0 = activated, 1 = not activated
-        if ($activationStatus.ActivationStatus -eq 0) {
-            Write-Host "[OK] License server is already activated." -ForegroundColor Green
-        }
-        else {
-            Write-Host "[ACTIVATING] Using Enterprise Agreement: $AgreementNumber ..." -ForegroundColor Yellow
-            $result = $wmiObj.ActivateServerAutomatic()
-            if ($result.ReturnValue -eq 0) {
-                Write-Host "[OK] License server activated successfully." -ForegroundColor Green
+if ($DoActivate) {
+    Write-Step "STEP 2b: Activating License Server (Enterprise Agreement)"
+    try {
+        $wmiObj = Get-WmiObject -Namespace "root\cimv2" -Class "Win32_TSLicenseServer" -ErrorAction Stop
+        if ($wmiObj) {
+            $activationStatus = $wmiObj.GetActivationStatus()
+            if ($activationStatus.ActivationStatus -eq 0) {
+                Write-Host "[OK] License server is already activated." -ForegroundColor Green
             }
             else {
-                Write-Host "[WARN] Automatic activation returned code: $($result.ReturnValue)" -ForegroundColor Yellow
-                Write-Host "[INFO] You may need to activate manually via Remote Desktop Licensing Manager." -ForegroundColor Yellow
-                Write-Host "[INFO] Open: licmgr.exe -> Right-click server -> Activate Server" -ForegroundColor Yellow
-                Write-Host "[INFO] Select 'Enterprise Agreement' and enter: $AgreementNumber" -ForegroundColor Yellow
+                Write-Host "[ACTIVATING] Using Enterprise Agreement: $AgreementNumber ..." -ForegroundColor Yellow
+                $result = $wmiObj.ActivateServerAutomatic()
+                if ($result.ReturnValue -eq 0) {
+                    Write-Host "[OK] License server activated successfully." -ForegroundColor Green
+                }
+                else {
+                    Write-Host "[WARN] Automatic activation returned code: $($result.ReturnValue)" -ForegroundColor Yellow
+                    Write-Host "[INFO] Activate manually: licmgr.exe -> Activate Server -> Enterprise Agreement -> $AgreementNumber" -ForegroundColor Yellow
+                }
             }
         }
+        else {
+            Write-Host "[WARN] WMI object Win32_TSLicenseServer not found." -ForegroundColor Yellow
+            Write-Host "[INFO] Activate manually: licmgr.exe -> Activate Server -> Enterprise Agreement -> $AgreementNumber" -ForegroundColor Yellow
+        }
     }
-    else {
-        Write-Host "[WARN] WMI object Win32_TSLicenseServer not found." -ForegroundColor Yellow
-        Write-Host "[INFO] Activate manually: licmgr.exe -> Activate Server -> Enterprise Agreement -> $AgreementNumber" -ForegroundColor Yellow
+    catch {
+        Write-Host "[WARN] Could not query license server WMI: $_" -ForegroundColor Yellow
+        Write-Host "[INFO] === MANUAL ACTIVATION ===" -ForegroundColor Yellow
+        Write-Host "[INFO] 1. licmgr.exe -> right-click server -> Activate Server" -ForegroundColor White
+        Write-Host "[INFO] 2. Method: Automatic; Program: Enterprise Agreement" -ForegroundColor White
+        Write-Host "[INFO] 3. Agreement Number: $AgreementNumber" -ForegroundColor White
+        Write-Host "[INFO] 4. Install Licenses -> Enterprise Agreement -> RDS Per User CALs" -ForegroundColor White
     }
+    Set-ItemProperty -Path $rdshPath -Name "EnterpriseAgreement" -Value $AgreementNumber -Type String
 }
-catch {
-    Write-Host "[WARN] Could not query license server WMI: $_" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "[INFO] === MANUAL ACTIVATION INSTRUCTIONS ===" -ForegroundColor Yellow
-    Write-Host "[INFO] 1. Open: licmgr.exe (Remote Desktop Licensing Manager)" -ForegroundColor White
-    Write-Host "[INFO] 2. Right-click your server -> 'Activate Server'" -ForegroundColor White
-    Write-Host "[INFO] 3. Connection method: Automatic / Web Browser" -ForegroundColor White
-    Write-Host "[INFO] 4. Select program: 'Enterprise Agreement'" -ForegroundColor White
-    Write-Host "[INFO] 5. Enter Agreement Number: $AgreementNumber" -ForegroundColor White
-    Write-Host "[INFO] 6. Then: Install Licenses -> Enterprise Agreement -> RDS Per User CALs" -ForegroundColor White
+else {
+    Write-Host "[INFO] Activation skipped. Run licmgr.exe later to activate via Enterprise Agreement." -ForegroundColor Yellow
 }
-
-# Also set registry for EA info (useful reference)
-Set-ItemProperty -Path $rdshPath -Name "EnterpriseAgreement" -Value $AgreementNumber -Type String
 
 # ==============================
 #  STEP 3: Create Local Users
 # ==============================
 
-Write-Step "STEP 3: Creating Local Users"
+if ($CreateUsers -and $Users.Count -gt 0) {
+    Write-Step "STEP 3: Creating Local Users"
 
-# Determine the localized name of "Remote Desktop Users" group
-$rdpGroupSID = "S-1-5-32-555"  # Well-known SID for Remote Desktop Users
-$rdpGroup = (New-Object System.Security.Principal.SecurityIdentifier($rdpGroupSID)).Translate(
-    [System.Security.Principal.NTAccount]
-).Value.Split('\')[-1]
+    # Localized name of the "Remote Desktop Users" group (well-known SID)
+    $rdpGroupSID = "S-1-5-32-555"
+    $rdpGroup = (New-Object System.Security.Principal.SecurityIdentifier($rdpGroupSID)).Translate(
+        [System.Security.Principal.NTAccount]
+    ).Value.Split('\')[-1]
+    Write-Host "[INFO] Remote Desktop Users group name: $rdpGroup" -ForegroundColor Gray
 
-Write-Host "[INFO] Remote Desktop Users group name: $rdpGroup" -ForegroundColor Gray
+    foreach ($user in $Users) {
+        $userName = $user.Name
+        $userPass = $user.Password
 
-foreach ($user in $Users) {
-    $userName = $user.Name
-    $userPass = $user.Password
+        $existingUser = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+        if ($existingUser) {
+            Write-Host "[SKIP] User '$userName' already exists — resetting password." -ForegroundColor Yellow
+            try {
+                $securePass = ConvertTo-SecureString $userPass -AsPlainText -Force
+                Set-LocalUser -Name $userName -Password $securePass -ErrorAction Stop
+                Write-Host "[OK] Password reset for existing user '$userName'." -ForegroundColor Green
+            } catch {
+                Write-Host "[WARN] Could not reset password for '$userName': $_" -ForegroundColor Yellow
+            }
+        }
+        else {
+            $securePass = ConvertTo-SecureString $userPass -AsPlainText -Force
+            New-LocalUser -Name $userName `
+                          -Password $securePass `
+                          -FullName $userName `
+                          -Description "RDS Terminal User" `
+                          -PasswordNeverExpires `
+                          -UserMayNotChangePassword:$false `
+                          -ErrorAction Stop | Out-Null
+            Write-Host "[OK] User '$userName' created." -ForegroundColor Green
+        }
 
-    $existingUser = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
-    if ($existingUser) {
-        Write-Host "[SKIP] User '$userName' already exists." -ForegroundColor Yellow
-    }
-    else {
-        $securePass = ConvertTo-SecureString $userPass -AsPlainText -Force
-        New-LocalUser -Name $userName `
-                      -Password $securePass `
-                      -FullName $userName `
-                      -Description "RDS Terminal User" `
-                      -PasswordNeverExpires `
-                      -UserMayNotChangePassword:$false `
-                      -ErrorAction Stop | Out-Null
-        Write-Host "[OK] User '$userName' created." -ForegroundColor Green
-    }
-
-    # Add user to Remote Desktop Users group
-    try {
-        Add-LocalGroupMember -Group $rdpGroup -Member $userName -ErrorAction Stop
-        Write-Host "[OK] '$userName' added to '$rdpGroup' group." -ForegroundColor Green
-    }
-    catch [Microsoft.PowerShell.Commands.MemberExistsException] {
-        Write-Host "[SKIP] '$userName' is already in '$rdpGroup'." -ForegroundColor Yellow
-    }
-    catch {
         try {
-            net localgroup "$rdpGroup" "$userName" /add 2>$null
-            Write-Host "[OK] '$userName' added to '$rdpGroup' (via net localgroup)." -ForegroundColor Green
+            Add-LocalGroupMember -Group $rdpGroup -Member $userName -ErrorAction Stop
+            Write-Host "[OK] '$userName' added to '$rdpGroup' group." -ForegroundColor Green
+        }
+        catch [Microsoft.PowerShell.Commands.MemberExistsException] {
+            Write-Host "[SKIP] '$userName' is already in '$rdpGroup'." -ForegroundColor Yellow
         }
         catch {
-            Write-Host "[WARN] Could not add '$userName' to RDP group: $_" -ForegroundColor Yellow
+            try {
+                net localgroup "$rdpGroup" "$userName" /add 2>$null
+                Write-Host "[OK] '$userName' added to '$rdpGroup' (via net localgroup)." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "[WARN] Could not add '$userName' to RDP group: $_" -ForegroundColor Yellow
+            }
         }
     }
+}
+else {
+    Write-Step "STEP 3: Creating Local Users (skipped)"
+    Write-Host "[INFO] User creation skipped by choice." -ForegroundColor Yellow
 }
 
 # ==============================
 #  STEP 4: Change RDP Port
 # ==============================
 
-Write-Step "STEP 4: Changing RDP Port"
-
-# Detect current port BEFORE changing
 $rdpPortPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
 $OldPort = (Get-ItemProperty -Path $rdpPortPath -Name "PortNumber").PortNumber
-Write-Host "[INFO] Current RDP port: $OldPort" -ForegroundColor Gray
 
-$NewPort = Get-RandomPort -Min $PortRangeMin -Max $PortRangeMax
-
-# Update RDP port in registry (takes effect after TermService restart)
-Set-ItemProperty -Path $rdpPortPath -Name "PortNumber" -Value $NewPort -Type DWord
-
-Write-Host "[OK] RDP port will change to: $NewPort (after service restart)" -ForegroundColor Green
+if ($ChangePort) {
+    Write-Step "STEP 4: Changing RDP Port"
+    Write-Host "[INFO] Current RDP port: $OldPort" -ForegroundColor Gray
+    $NewPort = Get-RandomPort -Min $PortRangeMin -Max $PortRangeMax
+    Set-ItemProperty -Path $rdpPortPath -Name "PortNumber" -Value $NewPort -Type DWord
+    Write-Host "[OK] RDP port will change to: $NewPort (after service restart)" -ForegroundColor Green
+}
+else {
+    Write-Step "STEP 4: Changing RDP Port (skipped)"
+    $NewPort = $OldPort
+    Write-Host "[INFO] Keeping current RDP port: $NewPort" -ForegroundColor Yellow
+}
 
 # ==============================
-#  STEP 5: Configure Firewall
-#  !! RDP-SAFE ORDER !!
-#
-#  1. Create rules for NEW port FIRST
-#  2. Create temporary rule for OLD port (keep current session alive)
-#  3. Set default policy to Block
-#  4. Disable other inbound rules
-#  5. Restart TermService (now listening on new port)
-#  6. Schedule removal of old port rule after grace period
+#  STEP 5: Configure Firewall (RDP-Safe)
 # ==============================
 
 Write-Step "STEP 5: Configuring Windows Firewall (RDP-Safe Mode)"
 
-Write-Host "[INFO] Using RDP-safe firewall sequence to prevent lockout." -ForegroundColor Cyan
-Write-Host "[INFO] Old port $OldPort will stay open for $FirewallGraceMinutes minutes after setup." -ForegroundColor Cyan
+if ($ChangePort) {
+    Write-Host "[INFO] Old port $OldPort will stay open for $FirewallGraceMinutes minutes after setup." -ForegroundColor Cyan
+}
 Write-Host ""
 
-# 5a. Clean up old custom rules from previous runs
-$oldRules = Get-NetFirewallRule -DisplayName "RDP-Custom-*" -ErrorAction SilentlyContinue
-if ($oldRules) {
-    $oldRules | Remove-NetFirewallRule
-    Write-Host "[CLEAN] Removed previous custom RDP firewall rules." -ForegroundColor Gray
+# 5a. Clean up rules from previous runs
+foreach ($pattern in @("RDP-Custom-*", "Allow-ICMPv4-In", "Allow-ICMPv6-In", "RDP-Temp-OldPort-*")) {
+    $r = Get-NetFirewallRule -DisplayName $pattern -ErrorAction SilentlyContinue
+    if ($r) { $r | Remove-NetFirewallRule }
 }
-$oldPing = Get-NetFirewallRule -DisplayName "Allow-ICMPv4-In" -ErrorAction SilentlyContinue
-if ($oldPing) { $oldPing | Remove-NetFirewallRule }
-$oldPing6 = Get-NetFirewallRule -DisplayName "Allow-ICMPv6-In" -ErrorAction SilentlyContinue
-if ($oldPing6) { $oldPing6 | Remove-NetFirewallRule }
-$oldGrace = Get-NetFirewallRule -DisplayName "RDP-Temp-OldPort-*" -ErrorAction SilentlyContinue
-if ($oldGrace) { $oldGrace | Remove-NetFirewallRule }
 
-# 5b. CREATE NEW PORT RULES FIRST (before any blocking!)
-New-NetFirewallRule -DisplayName "RDP-Custom-TCP-$NewPort" `
-    -Direction Inbound `
-    -Protocol TCP `
-    -LocalPort $NewPort `
-    -Action Allow `
-    -Profile Any `
-    -Enabled True | Out-Null
+# 5b. NEW port allow rules FIRST
+New-NetFirewallRule -DisplayName "RDP-Custom-TCP-$NewPort" -Direction Inbound -Protocol TCP -LocalPort $NewPort -Action Allow -Profile Any -Enabled True | Out-Null
+New-NetFirewallRule -DisplayName "RDP-Custom-UDP-$NewPort" -Direction Inbound -Protocol UDP -LocalPort $NewPort -Action Allow -Profile Any -Enabled True | Out-Null
+Write-Host "[OK] Firewall rules for RDP port $NewPort created (TCP + UDP)." -ForegroundColor Green
 
-New-NetFirewallRule -DisplayName "RDP-Custom-UDP-$NewPort" `
-    -Direction Inbound `
-    -Protocol UDP `
-    -LocalPort $NewPort `
-    -Action Allow `
-    -Profile Any `
-    -Enabled True | Out-Null
+# 5c. Temp rule for OLD port only if the port actually changed
+if ($ChangePort -and $OldPort -ne $NewPort) {
+    New-NetFirewallRule -DisplayName "RDP-Temp-OldPort-TCP-$OldPort" -Direction Inbound -Protocol TCP -LocalPort $OldPort -Action Allow -Profile Any -Enabled True | Out-Null
+    Write-Host "[OK] Temporary rule for OLD port $OldPort created (grace: ${FirewallGraceMinutes}min)." -ForegroundColor Yellow
+}
 
-Write-Host "[OK] Firewall rules for NEW port $NewPort created (TCP + UDP)." -ForegroundColor Green
-
-# 5c. CREATE TEMPORARY RULE for OLD port (keeps your current RDP session alive)
-New-NetFirewallRule -DisplayName "RDP-Temp-OldPort-TCP-$OldPort" `
-    -Direction Inbound `
-    -Protocol TCP `
-    -LocalPort $OldPort `
-    -Action Allow `
-    -Profile Any `
-    -Enabled True | Out-Null
-
-Write-Host "[OK] Temporary rule for OLD port $OldPort created (grace period: ${FirewallGraceMinutes}min)." -ForegroundColor Yellow
-
-# 5d. Allow ICMP (Ping) — ICMPv4 and ICMPv6
-New-NetFirewallRule -DisplayName "Allow-ICMPv4-In" `
-    -Direction Inbound `
-    -Protocol ICMPv4 `
-    -IcmpType 8 `
-    -Action Allow `
-    -Profile Any `
-    -Enabled True | Out-Null
-
-New-NetFirewallRule -DisplayName "Allow-ICMPv6-In" `
-    -Direction Inbound `
-    -Protocol ICMPv6 `
-    -IcmpType 8 `
-    -Action Allow `
-    -Profile Any `
-    -Enabled True | Out-Null
-
+# 5d. ICMP ping
+New-NetFirewallRule -DisplayName "Allow-ICMPv4-In" -Direction Inbound -Protocol ICMPv4 -IcmpType 8 -Action Allow -Profile Any -Enabled True | Out-Null
+New-NetFirewallRule -DisplayName "Allow-ICMPv6-In" -Direction Inbound -Protocol ICMPv6 -IcmpType 8 -Action Allow -Profile Any -Enabled True | Out-Null
 Write-Host "[OK] ICMP Ping (v4 + v6) allowed." -ForegroundColor Green
 
-# 5e. NOW safe to block — our rules are already in place
-Set-NetFirewallProfile -Profile Domain, Public, Private `
-    -DefaultInboundAction Block `
-    -DefaultOutboundAction Allow `
-    -Enabled True
-
+# 5e. Block all inbound
+Set-NetFirewallProfile -Profile Domain, Public, Private -DefaultInboundAction Block -DefaultOutboundAction Allow -Enabled True
 Write-Host "[OK] Default policy: Block ALL inbound, Allow outbound." -ForegroundColor Green
 
-# 5f. Disable all existing inbound rules EXCEPT our custom ones
+# 5f. Disable other inbound rules
 Get-NetFirewallRule -Direction Inbound -ErrorAction SilentlyContinue | Where-Object {
     $_.Enabled -eq 'True' -and
     $_.DisplayName -notlike "RDP-Custom-*" -and
     $_.DisplayName -notlike "RDP-Temp-*" -and
     $_.DisplayName -notlike "Allow-ICMP*"
 } | Set-NetFirewallRule -Enabled False
-
 Write-Host "[OK] All other inbound rules disabled." -ForegroundColor Green
 
 # ==============================
-#  STEP 6: Restart TermService
-#  (automatically — no interactive prompt)
+#  STEP 6: Additional RDS Settings
 # ==============================
 
-Write-Step "STEP 6: Restarting TermService"
+Write-Step "STEP 6: Additional Settings"
 
-Write-Host "[!] Restarting RDP service to apply new port $NewPort ..." -ForegroundColor Yellow
-Write-Host "[!] Your current session will drop. Reconnect to: ${NewPort}" -ForegroundColor Red
-Write-Host ""
+Set-ItemProperty -Path $rdpPortPath -Name "UserAuthentication" -Value 1 -Type DWord
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Type DWord
+Write-Host "[OK] NLA enabled, Remote Desktop connections enabled." -ForegroundColor Green
 
-# Save connection info BEFORE restarting (in case session drops)
+Set-ItemProperty -Path $rdshPath -Name "MaxIdleTime"          -Value 3600000  -Type DWord
+Set-ItemProperty -Path $rdshPath -Name "MaxDisconnectionTime" -Value 28800000 -Type DWord
+Set-ItemProperty -Path $rdshPath -Name "fResetBroken"         -Value 1        -Type DWord
+Write-Host "[OK] Session timeouts configured (idle: 60min, disconnected: 8h)." -ForegroundColor Green
+
+# ==============================
+#  STEP 7: Save connection info + credentials
+# ==============================
+
 $serverIP = (Get-NetIPAddress -AddressFamily IPv4 |
     Where-Object { $_.InterfaceAlias -notmatch "Loopback" -and $_.PrefixOrigin -ne "WellKnown" } |
     Select-Object -First 1).IPAddress
+
+$triggerTime = (Get-Date).AddMinutes($FirewallGraceMinutes)
+
+$userLines = if ($Users.Count -gt 0) {
+    ($Users | ForEach-Object { "    {0,-20} {1}" -f $_.Name, $_.Password }) -join "`n"
+} else {
+    "    (none created)"
+}
+
+$oldPortNote = if ($ChangePort -and $OldPort -ne $NewPort) {
+    "  Old port $OldPort will be closed automatically at $($triggerTime.ToString('HH:mm:ss'))."
+} else {
+    "  RDP port was not changed."
+}
 
 $infoFile = "$env:PUBLIC\Desktop\RDP-CONNECTION-INFO.txt"
 @"
@@ -365,11 +447,11 @@ $infoFile = "$env:PUBLIC\Desktop\RDP-CONNECTION-INFO.txt"
   RDP Port   : $NewPort
   Connect to : ${serverIP}:${NewPort}
 
-  Old port $OldPort will be closed automatically
-  after $FirewallGraceMinutes minutes.
+$oldPortNote
 
-  Users:
-$(($Users | ForEach-Object { "    - $($_.Name)" }) -join "`n")
+  !!! SENSITIVE — contains passwords. Store securely, then delete. !!!
+  Users (login / password):
+$userLines
 
   Firewall:
     - All inbound BLOCKED
@@ -377,108 +459,94 @@ $(($Users | ForEach-Object { "    - $($_.Name)" }) -join "`n")
     - TCP/UDP $NewPort ALLOWED
 
   Licensing:
-    - Mode: Per User
-    - EA: $AgreementNumber
+    - Mode: $licModeName
+    - EA: $(if ($DoActivate) { $AgreementNumber } else { "(not activated — do it via licmgr.exe)" })
 
 ==========================================
 "@ | Set-Content -Path $infoFile -Encoding UTF8
 
-# ==============================
-#  STEP 7: Schedule old port cleanup
-# ==============================
-
-# Create a script that removes the temporary old-port rule
-$cleanupScript = @"
-# Auto-generated: remove temporary old RDP port rule
+# 7b. Schedule old-port cleanup only if the port changed
+if ($ChangePort -and $OldPort -ne $NewPort) {
+    $cleanupScript = @"
 Start-Sleep -Seconds 10
 Get-NetFirewallRule -DisplayName "RDP-Temp-OldPort-*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-# Log the action
-Add-Content -Path "$env:PUBLIC\Desktop\RDP-CONNECTION-INFO.txt" -Value "`n  [$(Get-Date -Format 'HH:mm:ss')] Old port $OldPort firewall rule removed."
+Add-Content -Path "$infoFile" -Value "`n  [`$(Get-Date -Format 'HH:mm:ss')] Old port $OldPort firewall rule removed."
 "@
+    $cleanupScriptPath = "$env:ProgramData\Scripts\Remove-OldRdpPort.ps1"
+    $scriptsDir = Split-Path $cleanupScriptPath
+    if (-not (Test-Path $scriptsDir)) { New-Item -Path $scriptsDir -ItemType Directory -Force | Out-Null }
+    $cleanupScript | Set-Content -Path $cleanupScriptPath -Encoding UTF8
 
-$cleanupScriptPath = "$env:ProgramData\Scripts\Remove-OldRdpPort.ps1"
-$scriptsDir = Split-Path $cleanupScriptPath
-if (-not (Test-Path $scriptsDir)) { New-Item -Path $scriptsDir -ItemType Directory -Force | Out-Null }
-$cleanupScript | Set-Content -Path $cleanupScriptPath -Encoding UTF8
+    $taskAction    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$cleanupScriptPath`""
+    $taskTrigger   = New-ScheduledTaskTrigger -Once -At $triggerTime
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $taskSettings  = New-ScheduledTaskSettingsSet -DeleteExpiredTaskAfter "00:10:00" -StartWhenAvailable
 
-# Schedule the cleanup task to run once after the grace period
-$triggerTime = (Get-Date).AddMinutes($FirewallGraceMinutes)
-$taskAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$cleanupScriptPath`""
-$taskTrigger   = New-ScheduledTaskTrigger -Once -At $triggerTime
-$taskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$taskSettings  = New-ScheduledTaskSettingsSet -DeleteExpiredTaskAfter "00:10:00" -StartWhenAvailable
-
-Unregister-ScheduledTask -TaskName "RDS-RemoveOldPort" -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName "RDS-RemoveOldPort" `
-    -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings `
-    -Description "Remove temporary old RDP port ($OldPort) firewall rule after grace period" | Out-Null
-
-Write-Host "[OK] Old port $OldPort will be auto-closed at $($triggerTime.ToString('HH:mm:ss'))." -ForegroundColor Yellow
+    Unregister-ScheduledTask -TaskName "RDS-RemoveOldPort" -Confirm:$false -ErrorAction SilentlyContinue
+    Register-ScheduledTask -TaskName "RDS-RemoveOldPort" `
+        -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings `
+        -Description "Remove temporary old RDP port ($OldPort) firewall rule after grace period" | Out-Null
+    Write-Host "[OK] Old port $OldPort will be auto-closed at $($triggerTime.ToString('HH:mm:ss'))." -ForegroundColor Yellow
+}
 
 # ==============================
-#  STEP 8: Additional RDS Settings
-# ==============================
-
-Write-Step "STEP 8: Additional Settings"
-
-# Enable NLA (Network Level Authentication)
-Set-ItemProperty -Path $rdpPortPath -Name "UserAuthentication" -Value 1 -Type DWord
-Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-    -Name "fDenyTSConnections" -Value 0 -Type DWord
-
-Write-Host "[OK] NLA (Network Level Authentication) enabled." -ForegroundColor Green
-Write-Host "[OK] Remote Desktop connections enabled." -ForegroundColor Green
-
-# Set session limits (optional — prevents abandoned sessions)
-$sessionPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-Set-ItemProperty -Path $sessionPath -Name "MaxIdleTime"          -Value 3600000  -Type DWord  # 60 min idle
-Set-ItemProperty -Path $sessionPath -Name "MaxDisconnectionTime" -Value 28800000 -Type DWord  # 8 hours disconnected
-Set-ItemProperty -Path $sessionPath -Name "fResetBroken"         -Value 1        -Type DWord  # end broken sessions
-
-Write-Host "[OK] Session timeouts configured (idle: 60min, disconnected: 8h)." -ForegroundColor Green
-
-# ==============================
-#  SUMMARY
+#  SUMMARY REPORT
 # ==============================
 
 Write-Step "SETUP COMPLETE"
 
 Write-Host ""
 Write-Host "  SERVER IP    : $serverIP" -ForegroundColor White
-Write-Host "  NEW RDP PORT : $NewPort" -ForegroundColor White
+Write-Host "  RDP PORT     : $NewPort" -ForegroundColor White
 Write-Host "  CONNECT TO   : ${serverIP}:${NewPort}" -ForegroundColor Green
 Write-Host ""
-Write-Host "  USERS CREATED:" -ForegroundColor White
-foreach ($user in $Users) {
-    Write-Host "    - $($user.Name)" -ForegroundColor White
+
+Write-Host "  USERS CREATED (login / password):" -ForegroundColor White
+if ($Users.Count -gt 0) {
+    foreach ($user in $Users) {
+        Write-Host ("    {0,-20} {1}" -f $user.Name, $user.Password) -ForegroundColor Green
+    }
+} else {
+    Write-Host "    (none)" -ForegroundColor Yellow
 }
 Write-Host ""
+
 Write-Host "  FIREWALL:" -ForegroundColor White
 Write-Host "    - All inbound BLOCKED" -ForegroundColor Red
 Write-Host "    - ICMP Ping ALLOWED" -ForegroundColor Green
 Write-Host "    - TCP/UDP $NewPort ALLOWED (RDP)" -ForegroundColor Green
-Write-Host "    - TCP $OldPort TEMPORARILY open (closes at $($triggerTime.ToString('HH:mm:ss')))" -ForegroundColor Yellow
+if ($ChangePort -and $OldPort -ne $NewPort) {
+    Write-Host "    - TCP $OldPort TEMPORARILY open (closes at $($triggerTime.ToString('HH:mm:ss')))" -ForegroundColor Yellow
+}
 Write-Host ""
+
 Write-Host "  LICENSING:" -ForegroundColor White
-Write-Host "    - Mode: Per User" -ForegroundColor White
-Write-Host "    - EA Number: $AgreementNumber" -ForegroundColor White
-Write-Host "    - If not auto-activated, run: licmgr.exe" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  [!] SAVE THIS PORT: $NewPort" -ForegroundColor Red
-Write-Host "  [!] Connection info saved to: $infoFile" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "  ┌─────────────────────────────────────────────────┐" -ForegroundColor Yellow
-Write-Host "  │  Restarting TermService in 10 seconds...        │" -ForegroundColor Yellow
-Write-Host "  │  Your RDP session WILL disconnect.              │" -ForegroundColor Yellow
-Write-Host "  │                                                 │" -ForegroundColor Yellow
-Write-Host "  │  Reconnect using: ${serverIP}:${NewPort}  │" -ForegroundColor Green
-Write-Host "  │                                                 │" -ForegroundColor Yellow
-Write-Host "  │  Old port $OldPort stays open until $($triggerTime.ToString('HH:mm:ss'))     │" -ForegroundColor Yellow
-Write-Host "  └─────────────────────────────────────────────────┘" -ForegroundColor Yellow
+Write-Host "    - Mode: $licModeName" -ForegroundColor White
+if ($DoActivate) {
+    Write-Host "    - EA Number: $AgreementNumber" -ForegroundColor White
+    Write-Host "    - If not auto-activated, run: licmgr.exe" -ForegroundColor Yellow
+} else {
+    Write-Host "    - NOT activated — run licmgr.exe and use Enterprise Agreement" -ForegroundColor Yellow
+}
 Write-Host ""
 
-Start-Sleep -Seconds 10
+Write-Host "  [!] Credentials + connection info saved to: $infoFile" -ForegroundColor Cyan
+Write-Host "  [!] That file contains PASSWORDS — store it securely and delete afterwards." -ForegroundColor Red
+Write-Host ""
 
-# Restart TermService — this will drop the current RDP session
-Restart-Service -Name "TermService" -Force
+if ($ChangePort -and $OldPort -ne $NewPort) {
+    Write-Host "  [!] SAVE THIS PORT: $NewPort" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  ┌─────────────────────────────────────────────────┐" -ForegroundColor Yellow
+    Write-Host "  │  Restarting TermService in 10 seconds...        │" -ForegroundColor Yellow
+    Write-Host "  │  Your RDP session WILL disconnect.              │" -ForegroundColor Yellow
+    Write-Host "  │  Reconnect using the NEW port above.            │" -ForegroundColor Green
+    Write-Host "  └─────────────────────────────────────────────────┘" -ForegroundColor Yellow
+    Write-Host ""
+    Start-Sleep -Seconds 10
+    Restart-Service -Name "TermService" -Force
+}
+else {
+    Write-Host "  [OK] RDP port unchanged — no service restart needed." -ForegroundColor Green
+    Write-Host "  [OK] Setup finished." -ForegroundColor Green
+}

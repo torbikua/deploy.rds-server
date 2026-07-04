@@ -33,6 +33,8 @@
 param(
     # Name of the private folder created in each user profile.
     [string]$PrivateFolderName = "Private",
+    # Icon for the folder + desktop shortcut ("<dll>,<index>"). Default = padlock in shell32.
+    [string]$IconResource = "%SystemRoot%\System32\SHELL32.dll,48",
     # Also create/encrypt the folder for the admin running this script, right now.
     [switch]$ApplyToMeNow
 )
@@ -137,12 +139,51 @@ WARNING: if an administrator RESETS your password (you forgot it), or your
 profile is deleted, the files in this folder are lost forever - by design.
 "@ | Set-Content -Path $readme -Encoding UTF8
     }
+
+    # 5. Desktop shortcut to the Private folder
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $lnk = Join-Path $desktop "$folderName.lnk"
+    $ws = New-Object -ComObject WScript.Shell
+    $sc = $ws.CreateShortcut($lnk)
+    $sc.TargetPath   = $priv
+    $sc.IconLocation = "__ICON__"
+    $sc.Description   = "My private encrypted folder"
+    $sc.Save()
+    L "desktop shortcut -> $lnk"
+
+    # 6. Custom folder icon via desktop.ini (folder needs system/readonly flag)
+    $ini = Join-Path $priv "desktop.ini"
+    $iniText = @"
+[.ShellClassInfo]
+IconResource=__ICON__
+[ViewState]
+Mode=
+Vid=
+FolderType=Generic
+"@
+    Set-Content -Path $ini -Value $iniText -Encoding Unicode -Force
+    attrib +s +h "$ini"
+    attrib +r "$priv"
+    L "folder icon set via desktop.ini"
+
+    # 7. Pin the folder to Quick Access (Home / Favorites)
+    try {
+        $shApp  = New-Object -ComObject Shell.Application
+        $parent = $shApp.Namespace((Split-Path $priv -Parent))
+        $item   = $parent.ParseName((Split-Path $priv -Leaf))
+        $item.InvokeVerb("pintohome")
+        L "pinned to Quick Access"
+    } catch {
+        L "pin to Quick Access failed: $($_.Exception.Message)"
+    }
+
     L "=== done OK ==="
 } catch {
     L "ERROR: $($_.Exception.Message)"
 }
 '@
 $perUser = $perUser.Replace("__PRIVATE_NAME__", $PrivateFolderName)
+$perUser = $perUser.Replace("__ICON__", $IconResource)
 
 # Save the per-user script as UTF-8 with BOM (safe for Windows PowerShell 5.1)
 $enc = New-Object System.Text.UTF8Encoding($true)

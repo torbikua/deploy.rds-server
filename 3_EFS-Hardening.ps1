@@ -88,28 +88,39 @@ $scriptDir  = "$env:ProgramData\RDS-Harden"
 $userScript = Join-Path $scriptDir "Setup-PrivateFolder.ps1"
 if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null }
 
-# This runs in EACH USER'S OWN CONTEXT (via the scheduled task below), so cipher
+# This runs in EACH USER'S OWN CONTEXT (via the HKLM\Run entry below), so cipher
 # uses that user's EFS key and icacls acts as the folder owner.
 $perUser = @'
-$ErrorActionPreference = "SilentlyContinue"
+$ErrorActionPreference = "Continue"
+$log = Join-Path $env:TEMP "RDS-PrivateFolder.log"
+function L($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" | Out-File -FilePath $log -Append -Encoding UTF8 }
+L "=== start; user=$env:USERNAME profile=$env:USERPROFILE ==="
+
 $folderName = "__PRIVATE_NAME__"
 $priv = Join-Path $env:USERPROFILE $folderName
 
-# 1. Create the folder if missing
-if (-not (Test-Path $priv)) { New-Item -ItemType Directory -Path $priv -Force | Out-Null }
+try {
+    # 1. Create the folder if missing
+    if (-not (Test-Path $priv)) {
+        New-Item -ItemType Directory -Path $priv -Force | Out-Null
+        L "created folder: $priv"
+    } else {
+        L "folder already exists: $priv"
+    }
 
-# 2. EFS-encrypt with THIS user's key (folder attribute + existing files).
-#    Any new file dropped inside is auto-encrypted with the user's key.
-cipher /e /s:"$priv" | Out-Null
+    # 2. EFS-encrypt with THIS user's key (folder attribute + existing files).
+    #    Any new file dropped inside is auto-encrypted with the user's key.
+    $c = (cipher /e /s:"$priv" 2>&1 | Out-String)
+    L "cipher /e -> $($c.Trim())"
 
-# 3. Lock NTFS: break inheritance, grant only the user + SYSTEM (no Administrators).
-$me = "$env:USERDOMAIN\$env:USERNAME"
-icacls "$priv" /inheritance:r /grant:r "$me:(OI)(CI)F" "SYSTEM:(OI)(CI)F" | Out-Null
-icacls "$priv" /setowner "$me" | Out-Null
+    # 3. Lock NTFS: break inheritance, grant only the user + SYSTEM (no Administrators).
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    $a1 = (icacls "$priv" /inheritance:r /grant:r "$me:(OI)(CI)F" "SYSTEM:(OI)(CI)F" 2>&1 | Out-String)
+    L "icacls grant -> $($a1.Trim())"
 
-# 4. One-time hint file (only on first run)
-$readme = Join-Path $priv "_README.txt"
-if (-not (Test-Path $readme)) {
+    # 4. One-time hint file (only on first run)
+    $readme = Join-Path $priv "_README.txt"
+    if (-not (Test-Path $readme)) {
 @"
 This folder is private and encrypted (Windows EFS) with YOUR account key.
 - The administrator cannot read files placed here.
@@ -122,6 +133,10 @@ CHANGE YOUR PASSWORD THE RIGHT WAY:
 WARNING: if an administrator RESETS your password (you forgot it), or your
 profile is deleted, the files in this folder are lost forever - by design.
 "@ | Set-Content -Path $readme -Encoding UTF8
+    }
+    L "=== done OK ==="
+} catch {
+    L "ERROR: $($_.Exception.Message)"
 }
 '@
 $perUser = $perUser.Replace("__PRIVATE_NAME__", $PrivateFolderName)
@@ -135,24 +150,22 @@ Write-Host "[OK] Per-user script written: $userScript" -ForegroundColor Green
 icacls "$scriptDir" /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" | Out-Null
 
 # ------------------------------------------------------------------
-# 3. Register the per-user logon scheduled task (runs as each user)
+# 3. Register per-user logon autorun via HKLM\...\Run
+#    (this is reliable: entries here run at logon IN THE USER'S OWN CONTEXT,
+#    which is exactly what EFS needs. A scheduled task with a group principal
+#    proved unreliable for RDP logons.)
 # ------------------------------------------------------------------
-Write-Step "Registering logon task (runs in each user's context)"
+Write-Step "Registering per-user logon autorun (HKLM\Run)"
 
-$taskName = "RDS-PrivateFolder"
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$userScript`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-# GroupId BUILTIN\Users => the task runs as whichever user logs on (their context).
-$principal = New-ScheduledTaskPrincipal -GroupId "S-1-5-32-545" -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+$runKey  = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+$runName = "RDS-PrivateFolder"
+$runCmd  = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$userScript`""
+Set-ItemProperty -Path $runKey -Name $runName -Value $runCmd -Type String -Force
+Write-Host "[OK] Autorun registered: HKLM\...\Run\$runName" -ForegroundColor Green
+Write-Host "     Runs at each user's logon, in that user's context." -ForegroundColor Gray
 
-Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-    -Principal $principal -Settings $settings `
-    -Description "Create/encrypt/lock the per-user Private folder at logon (EFS)." | Out-Null
-Write-Host "[OK] Scheduled task '$taskName' registered (trigger: At logon, run as: the user)." -ForegroundColor Green
+# Clean up the old (unreliable) scheduled task if a previous run created it.
+Unregister-ScheduledTask -TaskName "RDS-PrivateFolder" -Confirm:$false -ErrorAction SilentlyContinue
 
 # ------------------------------------------------------------------
 # 4. Optionally apply to the current admin right now
@@ -172,6 +185,12 @@ Write-Host "  Each user gets: %USERPROFILE%\$PrivateFolderName" -ForegroundColor
 Write-Host "    - EFS-encrypted with their own key (admin cannot read content)" -ForegroundColor Green
 Write-Host "    - NTFS locked to the user + SYSTEM (Administrators removed)" -ForegroundColor Green
 Write-Host "    - Created automatically at each user's NEXT logon" -ForegroundColor Green
+Write-Host ""
+Write-Host "  NOTE: only the '$PrivateFolderName' folder is protected. The rest of the" -ForegroundColor Yellow
+Write-Host "        profile stays accessible to admins (by design - we do not touch it)." -ForegroundColor Gray
+Write-Host "  Users ALREADY logged in: have them re-login, OR run once now:" -ForegroundColor Yellow
+Write-Host "        powershell -ExecutionPolicy Bypass -File `"$userScript`"" -ForegroundColor White
+Write-Host "  Per-user log (for debugging): %TEMP%\RDS-PrivateFolder.log" -ForegroundColor Gray
 Write-Host ""
 Write-Host "  PASSWORD RULES:" -ForegroundColor White
 Write-Host "    - Users change their OWN password: Ctrl+Alt+End -> Change a password" -ForegroundColor Green

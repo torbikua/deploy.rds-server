@@ -12,10 +12,12 @@
 
     HOW IT WORKS
     EFS encrypts with the key of whoever performs the encryption, so it MUST run
-    in the user's own context. This script therefore installs a per-user logon
-    scheduled task (runs as the logging-on user) that creates/encrypts/locks the
-    Private folder on each logon. The admin script itself only deploys that task;
-    it does not (and cannot) encrypt other users' data from an admin context.
+    in the user's own context. This script therefore installs an HKLM\...\Run
+    entry (runs at logon as the logging-on user) that creates/encrypts/locks the
+    Private folder on each logon. The admin script itself only deploys it; it
+    does not (and cannot) encrypt other users' data from an admin context.
+    NOTE: only the Private folder is protected - the rest of the profile stays
+    accessible to administrators by design.
 
     PASSWORD RULE (important, by design):
       * Users MUST change their own password (Ctrl+Alt+End -> Change a password,

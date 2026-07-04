@@ -35,6 +35,13 @@ param(
     [string]$PrivateFolderName = "Private",
     # Icon for the folder + desktop shortcut ("<dll>,<index>"). Default = padlock in shell32.
     [string]$IconResource = "%SystemRoot%\System32\SHELL32.dll,48",
+    # Remove the Administrators group from each user's profile ROOT so admins get
+    # "Access Denied" opening C:\Users\<user> by default (existing + new users).
+    # ON by default (this is the behaviour you asked for). Disable with:
+    #   -LockProfileFromAdmins:$false
+    # NOTE: a local admin can still TAKE OWNERSHIP to get in (a visible action) -
+    # this removes default access, it is not a cryptographic wall.
+    [bool]$LockProfileFromAdmins = $true,
     # Also create/encrypt the folder for the admin running this script, right now.
     [switch]$ApplyToMeNow
 )
@@ -102,6 +109,7 @@ L "=== start; user=$env:USERNAME profile=$env:USERPROFILE ==="
 
 $folderName = "__PRIVATE_NAME__"
 $priv = Join-Path $env:USERPROFILE $folderName
+$lockProfile = __LOCKPROFILE__
 
 try {
     # 1. Create the folder if missing
@@ -177,6 +185,16 @@ FolderType=Generic
         L "pin to Quick Access failed: $($_.Exception.Message)"
     }
 
+    # 8. Remove the Administrators group from the profile ROOT (deterrent):
+    #    admins get "Access Denied" opening C:\Users\<user> by default.
+    #    S-1-5-32-544 = BUILTIN\Administrators (locale-independent).
+    if ($lockProfile) {
+        $p = $env:USERPROFILE
+        icacls "$p" /inheritance:d 2>&1 | Out-Null           # freeze inherited ACEs as explicit
+        $r = (icacls "$p" /remove:g "*S-1-5-32-544" 2>&1 | Out-String)
+        L "profile lock (remove Administrators from $p) -> $($r.Trim())"
+    }
+
     L "=== done OK ==="
 } catch {
     L "ERROR: $($_.Exception.Message)"
@@ -184,6 +202,7 @@ FolderType=Generic
 '@
 $perUser = $perUser.Replace("__PRIVATE_NAME__", $PrivateFolderName)
 $perUser = $perUser.Replace("__ICON__", $IconResource)
+$perUser = $perUser.Replace("__LOCKPROFILE__", $(if ($LockProfileFromAdmins) { '$true' } else { '$false' }))
 
 # Save the per-user script as UTF-8 with BOM (safe for Windows PowerShell 5.1)
 $enc = New-Object System.Text.UTF8Encoding($true)
@@ -230,8 +249,15 @@ Write-Host "    - EFS-encrypted with their own key (admin cannot read content)" 
 Write-Host "    - NTFS locked to the user + SYSTEM (Administrators removed)" -ForegroundColor Green
 Write-Host "    - Created automatically at each user's NEXT logon" -ForegroundColor Green
 Write-Host ""
-Write-Host "  NOTE: only the '$PrivateFolderName' folder is protected. The rest of the" -ForegroundColor Yellow
-Write-Host "        profile stays accessible to admins (by design - we do not touch it)." -ForegroundColor Gray
+if ($LockProfileFromAdmins) {
+    Write-Host "  PROFILE LOCK: Administrators removed from C:\Users\<user> root." -ForegroundColor Green
+    Write-Host "    - Admins get 'Access Denied' opening a user's profile by default." -ForegroundColor Green
+    Write-Host "    - To get in, an admin must explicitly TAKE OWNERSHIP (a visible act)." -ForegroundColor Gray
+    Write-Host "    - Applies to existing AND new users (runs at each logon)." -ForegroundColor Gray
+} else {
+    Write-Host "  PROFILE LOCK: disabled (-LockProfileFromAdmins:`$false)." -ForegroundColor Yellow
+}
+Write-Host ""
 Write-Host "  Users ALREADY logged in: have them re-login, OR run once now:" -ForegroundColor Yellow
 Write-Host "        powershell -ExecutionPolicy Bypass -File `"$userScript`"" -ForegroundColor White
 Write-Host "  Per-user log (for debugging): %TEMP%\RDS-PrivateFolder.log" -ForegroundColor Gray

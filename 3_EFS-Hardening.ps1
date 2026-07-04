@@ -116,8 +116,9 @@ try {
     L "cipher /e -> $($c.Trim())"
 
     # 3. Lock NTFS: break inheritance, grant only the user + SYSTEM (no Administrators).
+    #    NOTE: ${me} braces are required - "$me:(..." would be parsed as a $me: drive ref.
     $me = "$env:USERDOMAIN\$env:USERNAME"
-    $a1 = (icacls "$priv" /inheritance:r /grant:r "$me:(OI)(CI)F" "SYSTEM:(OI)(CI)F" 2>&1 | Out-String)
+    $a1 = (icacls "$priv" /inheritance:r /grant:r "${me}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" 2>&1 | Out-String)
     L "icacls grant -> $($a1.Trim())"
 
     # 4. One-time hint file (only on first run)
